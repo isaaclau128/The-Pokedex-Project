@@ -12,6 +12,13 @@ from torchvision import transforms
 import pandas as pd
 import os
 import sys
+import platform
+
+try:
+    import AVFoundation  # type: ignore[import-not-found]
+    AVFOUNDATION_AVAILABLE = True
+except Exception:
+    AVFOUNDATION_AVAILABLE = False
 
 # ===================== Model Definition =====================
 class CNNClassifier(nn.Module):
@@ -154,6 +161,67 @@ def draw_predictions(frame, predictions):
     return frame
 
 
+def get_preferred_camera_indices():
+    """Return camera indices ordered with the built-in MacBook camera first."""
+    indices = [0, 1, 2, 3]
+    if not AVFOUNDATION_AVAILABLE or platform.system() != "Darwin":
+        return indices
+
+    try:
+        devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo)
+        ranked_indices = []
+        fallback_indices = []
+
+        for index, device in enumerate(devices):
+            name = str(device.localizedName())
+            lower_name = name.lower()
+
+            if any(token in lower_name for token in ["macbook", "built-in", "facetime hd"]):
+                ranked_indices.append(index)
+            elif any(token in lower_name for token in ["iphone", "continuity", "external"]):
+                fallback_indices.append(index)
+            else:
+                fallback_indices.append(index)
+
+        ordered = ranked_indices + [index for index in fallback_indices if index not in ranked_indices]
+        if ordered:
+            return ordered
+    except Exception as e:
+        print(f"Camera device discovery failed, falling back to default order: {e}")
+
+    return indices
+
+
+def initialize_camera():
+    """Open the first working camera and warm it up."""
+    camera_indices = get_preferred_camera_indices()
+    if platform.system() == "Darwin":
+        backends = [cv2.CAP_AVFOUNDATION, None]
+    else:
+        backends = [None]
+
+    for camera_index in camera_indices:
+        for backend in backends:
+            cap = cv2.VideoCapture(camera_index) if backend is None else cv2.VideoCapture(camera_index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            # Give the camera a moment to produce its first valid frame.
+            for _ in range(5):
+                cap.read()
+
+            ret, _ = cap.read()
+            if ret:
+                if camera_index != 0:
+                    print(f"✓ Camera opened successfully on index {camera_index}")
+                return cap
+
+            cap.release()
+
+    return None
+
+
 # ===================== Main Camera Loop =====================
 def main():
     print("=" * 50)
@@ -171,8 +239,8 @@ def main():
     print(f"✓ Loaded {len(class_names)} Pokemon classes")
     
     # Initialize camera
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    cap = initialize_camera()
+    if cap is None:
         print("Error: Cannot open camera. Make sure a camera is connected.")
         sys.exit(1)
     
@@ -183,13 +251,29 @@ def main():
     paused = False
     last_prediction = None
     frame_count = 0
+    frozen_frame = None
     
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Error: Cannot read from camera")
-                break
+            if paused and frozen_frame is not None:
+                frame = frozen_frame.copy()
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    # Retry a few times before giving up; some macOS cameras need brief recovery time.
+                    retry_success = False
+                    for _ in range(5):
+                        ret, frame = cap.read()
+                        if ret:
+                            retry_success = True
+                            break
+
+                    if not retry_success:
+                        print("Error: Cannot read from camera")
+                        break
+
+                if not paused:
+                    frozen_frame = frame.copy()
             
             # Resize for display (optional, for faster processing)
             display_frame = cv2.resize(frame, (800, 600))
@@ -222,6 +306,10 @@ def main():
                 cv2.putText(display_frame, "PAUSED - Press R to Resume", 
                            (display_frame.shape[1]//2 - 150, 50),
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+                # Keep the most recent predictions visible while paused.
+                if last_prediction:
+                    display_frame = draw_predictions(display_frame, last_prediction)
             
             # Display frame
             cv2.imshow("Pokemon Recognition", display_frame)
@@ -233,8 +321,11 @@ def main():
                 break
             elif key == ord(' '):
                 paused = True
+                if frozen_frame is None:
+                    frozen_frame = frame.copy()
             elif key == ord('r'):
                 paused = False
+                frozen_frame = None
     
     except KeyboardInterrupt:
         print("\nInterrupted by user")
