@@ -13,6 +13,9 @@ import pandas as pd
 import os
 import sys
 import platform
+import json
+
+from torchvision import models
 
 try:
     import AVFoundation  # type: ignore[import-not-found]
@@ -47,11 +50,20 @@ class CNNClassifier(nn.Module):
         return x
 
 
+def create_resnet50_model(num_classes=1000):
+    """Create a ResNet50 classifier without downloading pretrained weights."""
+    model = models.resnet50(weights=None)
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    return model
+
+
 # ===================== Configuration =====================
 IMG_SIZE = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "./pokemon_model.pth"
 METADATA_PATH = "./pokemon-dataset-1000/metadata.csv"
+TEMPERATURE_PATH = "./temperature.json"
 
 # Image preprocessing transforms (must match training transforms)
 transform = transforms.Compose([
@@ -66,6 +78,15 @@ transform = transforms.Compose([
 def load_class_names(metadata_path):
     """Load Pokemon class names from metadata CSV"""
     try:
+        # Prefer an explicit classes.json saved at training time to ensure
+        # the same ordering/mapping used during training is restored.
+        classes_json = './classes.json'
+        if os.path.exists(classes_json):
+            with open(classes_json, 'r') as f:
+                class_names = json.load(f)
+                print(f"✓ Loaded class names from {classes_json}")
+                return class_names
+
         if os.path.exists(metadata_path):
             df = pd.read_csv(metadata_path)
             # Get unique class names sorted (assumes 'label' column exists)
@@ -79,7 +100,7 @@ def load_class_names(metadata_path):
     return [f"Pokemon_{i}" for i in range(1000)]
 
 
-def load_model(model_path, device):
+def load_model(model_path, device, num_classes=1000):
     """Load the trained model"""
     try:
         if not os.path.exists(model_path):
@@ -89,14 +110,38 @@ def load_model(model_path, device):
             print("  torch.save(model.state_dict(), './pokemon_model.pth')")
             return None
         
-        model = CNNClassifier(img_size=IMG_SIZE, num_classes=1000).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        state_dict = torch.load(model_path, map_location=device)
+
+        if any(key.startswith("layer1.") or key.startswith("bn1.") for key in state_dict.keys()):
+            model = create_resnet50_model(num_classes=num_classes).to(device)
+            architecture = "ResNet50"
+        else:
+            model = CNNClassifier(img_size=IMG_SIZE, num_classes=num_classes).to(device)
+            architecture = "CNN"
+
+        model.load_state_dict(state_dict)
         model.eval()
-        print(f"✓ Model loaded successfully from {model_path}")
+        print(f"✓ Model loaded successfully from {model_path} ({architecture})")
         return model
     except Exception as e:
         print(f"Error loading model: {e}")
         return None
+
+
+def load_temperature(temperature_path):
+    """Load a calibrated temperature from disk, if available."""
+    try:
+        if os.path.exists(temperature_path):
+            with open(temperature_path, 'r') as f:
+                payload = json.load(f)
+                temperature = float(payload.get('temperature', 1.0))
+                if temperature > 0:
+                    print(f"✓ Loaded calibrated temperature: {temperature:.4f}")
+                    return temperature
+    except Exception as e:
+        print(f"Warning: could not load temperature calibration: {e}")
+
+    return 1.0
 
 
 def preprocess_frame(frame, transform, device):
@@ -120,19 +165,21 @@ def preprocess_frame(frame, transform, device):
         return None
 
 
-def get_top_predictions(output, class_names, top_k=3):
+def get_top_predictions(output, class_names, top_k=3, temperature=1.0):
     """Get top K predictions with probabilities"""
-    probabilities = torch.softmax(output, dim=1)
+    scaled_output = output / temperature
+    probabilities = torch.softmax(scaled_output, dim=1)
     top_probs, top_indices = torch.topk(probabilities, top_k, dim=1)
-    
+
     predictions = []
     for prob, idx in zip(top_probs[0].cpu().numpy(), top_indices[0].cpu().numpy()):
+        name = class_names[idx] if idx < len(class_names) else f"Pokemon_{idx}"
         predictions.append({
-            'name': class_names[idx],
+            'name': name,
             'confidence': prob,
-            'index': idx
+            'index': int(idx)
         })
-    
+
     return predictions
 
 
@@ -228,15 +275,18 @@ def main():
     print("Pokemon Recognition - Camera Mode")
     print("=" * 50)
     
-    # Load model
-    model = load_model(MODEL_PATH, DEVICE)
-    if model is None:
-        print("Cannot start camera mode without a trained model.")
-        sys.exit(1)
-    
     # Load class names
     class_names = load_class_names(METADATA_PATH)
     print(f"✓ Loaded {len(class_names)} Pokemon classes")
+
+    # Load model after class names so the classifier head matches the dataset order.
+    model = load_model(MODEL_PATH, DEVICE, num_classes=len(class_names))
+    if model is None:
+        print("Cannot start camera mode without a trained model.")
+        sys.exit(1)
+
+    # Load calibrated temperature if present.
+    temperature = load_temperature(TEMPERATURE_PATH)
     
     # Initialize camera
     cap = initialize_camera()
@@ -292,7 +342,12 @@ def main():
                                 output = model(input_tensor)
                             
                             # Get predictions
-                            last_prediction = get_top_predictions(output, class_names, top_k=3)
+                            last_prediction = get_top_predictions(
+                                output,
+                                class_names,
+                                top_k=3,
+                                temperature=temperature,
+                            )
                     
                     except Exception as e:
                         print(f"Inference error: {e}")
