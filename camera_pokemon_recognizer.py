@@ -59,7 +59,7 @@ def create_resnet50_model(num_classes=1000):
 
 
 # ===================== Configuration =====================
-IMG_SIZE = 128
+IMG_SIZE = 224  # ResNet50 standard input size (was 128; larger = better accuracy for ResNet50)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = "./pokemon_model.pth"
 METADATA_PATH = "./pokemon-dataset-1000/metadata.csv"
