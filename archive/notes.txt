@@ -1,0 +1,18 @@
+To collect real camera frames: python collect_camera_frames.py
+
+To run the program: python camera_pokemon_recognizer.py
+
+
+
+
+# Step 1: Collect labeled camera frames (~100-200)
+python collect_camera_frames.py
+# Press SPACE to capture, type name, repeat for 10+ mins
+
+# Step 2: Fine-tune model on those frames
+python finetune_on_camera_frames.py
+# Waits for your collected frames, trains for ~3 mins
+
+# Step 3: Test improved camera detection
+python camera_pokemon_recognizer.py
+# Should now detect much better!
